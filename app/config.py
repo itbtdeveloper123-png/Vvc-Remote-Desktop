@@ -7,7 +7,7 @@ from typing import List
 class NetworkConfig:
     host: str = "0.0.0.0"
     port: int = 8000
-    central_relay_url: str = os.getenv("VVC_RELAY_URL", "")
+    central_relay_url: str = os.getenv("VVC_RELAY_URL", "https://vvc-remote-relay.onrender.com")
     ice_servers: List[dict] = field(default_factory=lambda: [
         {"urls": "stun:stun.l.google.com:19302"},
         {"urls": "stun:stun1.l.google.com:19302"},

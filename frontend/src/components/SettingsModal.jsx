@@ -11,7 +11,7 @@ export function SettingsModal({
   onToast
 }) {
   const [fps, setFps] = useState('30');
-  const [relayUrl, setRelayUrl] = useState(() => localStorage.getItem('vvc_relay_url') || '');
+  const [relayUrl, setRelayUrl] = useState(() => localStorage.getItem('vvc_relay_url') || 'https://vvc-remote-relay.onrender.com');
 
   if (!isOpen) return null;
 
