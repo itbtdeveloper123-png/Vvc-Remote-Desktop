@@ -1,0 +1,10 @@
+mss>=10.2.0
+pynput>=1.8.2
+aiortc>=1.15.0
+opencv-python>=4.11.0
+pillow>=11.0.0
+numpy>=2.0.0
+fastapi>=0.115.0
+uvicorn>=0.34.0
+websockets>=15.0
+av>=14.0.0

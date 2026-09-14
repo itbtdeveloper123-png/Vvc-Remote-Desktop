@@ -1,0 +1,28 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# PyInstaller & Compilation outputs (Very large binaries)
+build/
+dist/
+*.spec
+*.zip
+*.exe
+
+# Node / Vite frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Temporary and database files
+*.db
+*.sqlite3
+*.log
+.DS_Store
+Thumbs.db
