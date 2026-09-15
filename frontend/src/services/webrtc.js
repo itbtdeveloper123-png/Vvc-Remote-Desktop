@@ -130,16 +130,25 @@ export class RemoteStreamSession {
 
       // Wait for ICE gathering (STUN / TURN reflexive candidates)
       await new Promise((resolve) => {
-        if (this.pc.iceGatheringState === 'complete') resolve();
-        else {
+        if (this.pc.iceGatheringState === 'complete') {
+          resolve();
+        } else {
+          let resolved = false;
           const check = () => {
-            if (this.pc.iceGatheringState === 'complete') {
+            if (!resolved && this.pc.iceGatheringState === 'complete') {
+              resolved = true;
               this.pc.removeEventListener('icegatheringstatechange', check);
               resolve();
             }
           };
           this.pc.addEventListener('icegatheringstatechange', check);
-          setTimeout(resolve, 2000); // 2s gathering ceiling for STUN candidates
+          setTimeout(() => {
+            if (!resolved) {
+              resolved = true;
+              this.pc.removeEventListener('icegatheringstatechange', check);
+              resolve();
+            }
+          }, 3500); // 3.5s gathering ceiling for STUN candidates
         }
       });
 

@@ -90,8 +90,25 @@ class CloudRelayClient:
             except Exception:
                 pass
 
+        self._last_pong = time.time()
+        self._keepalive_task: Optional[asyncio.Task] = None
+
+    async def _keepalive_sender(self, ws):
+        """Periodically sends application keepalive ping to prevent proxy drops."""
+        try:
+            while self.running and self.ws == ws:
+                await asyncio.sleep(15)
+                if not self.running or self.ws != ws:
+                    break
+                try:
+                    await ws.send(json.dumps({"type": "ping", "time": time.time()}))
+                except Exception:
+                    break
+        except asyncio.CancelledError:
+            pass
+
     async def _connection_loop(self):
-        """Persistent connection loop with automatic reconnect and keepalive."""
+        """Persistent connection loop with automatic reconnect and active keepalive."""
         import websockets
 
         ws_url = self.get_ws_url()
@@ -108,12 +125,19 @@ class CloudRelayClient:
                 ) as ws:
                     self.ws = ws
                     self.connected = True
+                    self._last_pong = time.time()
                     backoff = 2
                     logger.info(f"[✓] Connected & Registered with Vvc Central Signaling Server as Peer {self.peer_id}!")
 
-                    while self.running:
-                        message = await ws.recv()
-                        await self._handle_message(message)
+                    # Launch active keepalive task
+                    keepalive_task = asyncio.create_task(self._keepalive_sender(ws))
+
+                    try:
+                        while self.running:
+                            message = await ws.recv()
+                            await self._handle_message(message)
+                    finally:
+                        keepalive_task.cancel()
 
             except asyncio.CancelledError:
                 break
@@ -123,7 +147,7 @@ class CloudRelayClient:
                 if self.running:
                     logger.warning(f"[!] Cloud Relay disconnected: {e}. Reconnecting in {backoff}s...")
                     await asyncio.sleep(backoff)
-                    backoff = min(30, backoff * 1.5)
+                    backoff = min(20, backoff * 1.5)
 
     async def _handle_message(self, raw_message: str):
         try:
@@ -134,23 +158,33 @@ class CloudRelayClient:
         msg_type = data.get("type")
         sender = data.get("from")
 
+        # Keepalive response from relay server
+        if msg_type == "pong":
+            self._last_pong = time.time()
+            return
+
         # 1. Incoming Connection Request from remote peer
         if msg_type == "connect_request":
             req_id = data.get("request_id")
             if self.on_incoming_request:
-                try:
-                    res = self.on_incoming_request(data)
-                    if asyncio.iscoroutine(res):
-                        res = await res
-                    if res and isinstance(res, dict):
-                        await self._send_ws({
-                            "type": "connect_response",
-                            "to": sender,
-                            "request_id": req_id,
-                            **res
-                        })
-                except Exception as e:
-                    logger.error(f"Error handling incoming connect request: {e}")
+                async def _process_incoming():
+                    try:
+                        res = self.on_incoming_request(data)
+                        if asyncio.iscoroutine(res):
+                            res = await res
+                        if res and isinstance(res, dict):
+                            await self._send_ws({
+                                "type": "connect_response",
+                                "to": sender,
+                                "request_id": req_id,
+                                **res
+                            })
+                    except Exception as e:
+                        logger.error(f"Error handling incoming connect request: {e}")
+
+                loop = self._loop or asyncio.get_event_loop()
+                if loop and loop.is_running():
+                    loop.create_task(_process_incoming())
 
         # 2. Response to an outgoing request we made
         elif msg_type == "connect_response":
@@ -163,20 +197,25 @@ class CloudRelayClient:
         # 3. WebRTC Offer forwarded from remote client
         elif msg_type == "webrtc_offer":
             if self.on_offer_received:
-                try:
-                    res = self.on_offer_received(data)
-                    if asyncio.iscoroutine(res):
-                        res = await res
-                    if res and isinstance(res, dict):
-                        await self._send_ws({
-                            "type": "webrtc_answer",
-                            "to": sender,
-                            "sdp": res.get("sdp"),
-                            "offer_type": res.get("type", "answer"),
-                            "session_id": data.get("session_id")
-                        })
-                except Exception as e:
-                    logger.error(f"Error handling incoming WebRTC offer: {e}")
+                async def _process_offer():
+                    try:
+                        res = self.on_offer_received(data)
+                        if asyncio.iscoroutine(res):
+                            res = await res
+                        if res and isinstance(res, dict):
+                            await self._send_ws({
+                                "type": "webrtc_answer",
+                                "to": sender,
+                                "sdp": res.get("sdp"),
+                                "offer_type": res.get("type", "answer"),
+                                "session_id": data.get("session_id")
+                            })
+                    except Exception as e:
+                        logger.error(f"Error handling incoming WebRTC offer: {e}")
+
+                loop = self._loop or asyncio.get_event_loop()
+                if loop and loop.is_running():
+                    loop.create_task(_process_offer())
 
         # 4. WebRTC Answer received from remote host
         elif msg_type == "webrtc_answer":
@@ -247,6 +286,13 @@ class CloudRelayClient:
         clean_target = "".join(c for c in str(target_id) if c.isdigit())
         req_id = f"req_{int(time.time() * 1000)}"
 
+        # Wait briefly for connection if reconnecting
+        if not self.connected or not self.ws:
+            for _ in range(8):
+                if self.connected and self.ws:
+                    break
+                await asyncio.sleep(0.5)
+
         try:
             current_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -288,6 +334,13 @@ class CloudRelayClient:
         """Sends WebRTC SDP offer to remote host and waits for SDP answer."""
         clean_target = "".join(c for c in str(target_id) if c.isdigit())
         sid = session_id or f"sess_{int(time.time() * 1000)}"
+
+        # Wait briefly for connection if reconnecting
+        if not self.connected or not self.ws:
+            for _ in range(8):
+                if self.connected and self.ws:
+                    break
+                await asyncio.sleep(0.5)
 
         try:
             current_loop = asyncio.get_running_loop()

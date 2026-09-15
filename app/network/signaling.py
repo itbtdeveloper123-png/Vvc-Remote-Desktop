@@ -1,4 +1,5 @@
 """FastAPI Signaling Server and Unified Endpoint Router"""
+import asyncio
 import sys
 import os
 import shutil
@@ -660,7 +661,7 @@ def create_app(
         require_host_authorization(request)
         if not cloud_relay:
             return {"success": False, "message": "Cloud Relay client is not enabled"}
-        res = await cloud_relay.request_remote_connect(req_data.target_peer_id, timeout=45.0)
+        res = await cloud_relay.request_remote_connect(req_data.target_peer_id, timeout=55.0)
         return res
 
     class RelayWebRTCOfferRequest(BaseModel):

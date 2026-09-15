@@ -253,7 +253,15 @@ export default function App() {
 
     let targetBaseUrl = '';
     let isRelay = false;
-    if (explicitIp) {
+    const isExplicitRelay = explicitIp && (
+      explicitIp.toLowerCase().includes('relay') ||
+      explicitIp === 'Global Cloud Relay'
+    );
+
+    if (isExplicitRelay) {
+      isRelay = true;
+      targetBaseUrl = 'relay';
+    } else if (explicitIp) {
       targetBaseUrl = explicitIp.startsWith('http') ? explicitIp : `http://${explicitIp}`;
     } else {
       try {
@@ -293,13 +301,32 @@ export default function App() {
       if (isRelay) {
         reqRes = await initRelayConnectRequest(cleanId);
       } else {
-        reqRes = await initConnectRequest(targetBaseUrl, hostInfo?.peer_id || '999999999');
+        try {
+          reqRes = await initConnectRequest(targetBaseUrl, hostInfo?.peer_id || '999999999');
+        } catch (directErr) {
+          // Automatic seamless fallback to Cloud Relay if direct LAN connection fails
+          console.warn('Direct LAN connection failed, falling back to Cloud Relay:', directErr);
+          setConnectStatus('Direct IP unreachable. Connecting via Cloud Relay...');
+          try {
+            const resolved = await resolvePeer(cleanId);
+            if (resolved && resolved.success && (resolved.type === 'relay' || resolved.relay || resolved.online)) {
+              isRelay = true;
+              targetBaseUrl = 'relay';
+              reqRes = await initRelayConnectRequest(cleanId);
+            } else {
+              throw directErr;
+            }
+          } catch (_) {
+            throw directErr;
+          }
+        }
       }
 
-      if (!reqRes || reqRes.success === false || reqRes.status === 'offline' || reqRes.status === 'rejected') {
+      if (!reqRes || reqRes.success === false || reqRes.status === 'offline' || reqRes.status === 'rejected' || reqRes.status === 'timeout') {
         setConnecting(false);
         setConnectStatus('');
-        showToast(reqRes?.message || 'Connection request was declined or partner is offline', 'error');
+        const errMsg = reqRes?.message || (reqRes?.status === 'rejected' ? 'Connection request was declined by the partner' : 'Connection request timed out or partner is offline');
+        showToast(errMsg, 'error');
         return;
       }
 
