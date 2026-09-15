@@ -7,6 +7,7 @@ export class RemoteStreamSession {
     peerId,
     targetBaseUrl = '',
     sessionId,
+    isRelay = false,
     nativeWidth = 1920,
     nativeHeight = 1080,
     onTelemetry,
@@ -16,6 +17,7 @@ export class RemoteStreamSession {
     this.peerId = peerId;
     this.targetBaseUrl = targetBaseUrl;
     this.sessionId = sessionId;
+    this.isRelay = isRelay || targetBaseUrl === 'relay';
     this.nativeWidth = nativeWidth;
     this.nativeHeight = nativeHeight;
 
@@ -58,10 +60,28 @@ export class RemoteStreamSession {
     const baseUrl = this.targetBaseUrl || window.location.origin;
 
     try {
-      // 1. Fetch ICE servers from host
-      const infoRes = await fetch(`${baseUrl}/api/info`);
-      const info = await infoRes.json();
-      const iceServers = info.ice_servers || [{ urls: 'stun:stun.l.google.com:19302' }];
+      // 1. Fetch ICE servers from host or use Google STUN + OpenRelay TURN for WAN NAT Traversal
+      let iceServers = [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun.cloudflare.com:3478' },
+        {
+          urls: [
+            'turn:openrelay.metered.ca:80',
+            'turn:openrelay.metered.ca:443',
+            'turn:openrelay.metered.ca:443?transport=tcp'
+          ],
+          username: 'openrelay',
+          credential: 'openrelay'
+        }
+      ];
+      if (!this.isRelay && baseUrl && !baseUrl.includes('relay')) {
+        try {
+          const infoRes = await fetch(`${baseUrl}/api/info`);
+          const info = await infoRes.json();
+          if (info.ice_servers && info.ice_servers.length > 0) iceServers = info.ice_servers;
+        } catch (_) {}
+      }
 
       this.pc = new RTCPeerConnection({ iceServers });
 
@@ -73,7 +93,7 @@ export class RemoteStreamSession {
 
       this.dataChannel.onopen = () => {
         this.isConnected = true;
-        this.protocol = 'WebRTC';
+        this.protocol = this.isRelay ? 'WebRTC (Cloud Relay P2P)' : 'WebRTC (Direct LAN)';
         this.onStatusChange('connected');
         this._startTelemetry();
       };
@@ -96,8 +116,9 @@ export class RemoteStreamSession {
       };
 
       this.pc.oniceconnectionstatechange = () => {
-        if (['failed', 'disconnected'].includes(this.pc.iceConnectionState)) {
-          console.warn('[WebRTC] Connection degraded. Initiating WebSocket fallback...');
+        console.log(`[WebRTC] ICE Connection State: ${this.pc.iceConnectionState}`);
+        if (this.pc.iceConnectionState === 'failed') {
+          console.warn('[WebRTC] ICE Connection failed. Initiating fallback...');
           this._fallbackToWebSocket();
         }
       };
@@ -107,7 +128,7 @@ export class RemoteStreamSession {
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
 
-      // Wait for ICE gathering
+      // Wait for ICE gathering (STUN / TURN reflexive candidates)
       await new Promise((resolve) => {
         if (this.pc.iceGatheringState === 'complete') resolve();
         else {
@@ -118,34 +139,60 @@ export class RemoteStreamSession {
             }
           };
           this.pc.addEventListener('icegatheringstatechange', check);
-          setTimeout(resolve, 1500); // 1.5s gathering ceiling
+          setTimeout(resolve, 2000); // 2s gathering ceiling for STUN candidates
         }
       });
 
-      // 4. Negotiate with Host
-      const offerRes = await fetch(`${baseUrl}/api/webrtc/offer`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sdp: this.pc.localDescription.sdp,
-          type: this.pc.localDescription.type,
-          session_id: this.sessionId
-        })
-      });
+      // 4. Negotiate with Host (Direct LAN HTTP or Global Cloud Relay)
+      let answer;
+      if (this.isRelay) {
+        const relayRes = await fetch('/api/relay/webrtc-offer', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            target_peer_id: this.peerId,
+            sdp: this.pc.localDescription.sdp,
+            offer_type: this.pc.localDescription.type,
+            session_id: this.sessionId
+          })
+        });
+        if (!relayRes.ok) throw new Error('WebRTC Cloud Relay negotiation failed');
+        answer = await relayRes.json();
+      } else {
+        const offerRes = await fetch(`${baseUrl}/api/webrtc/offer`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sdp: this.pc.localDescription.sdp,
+            type: this.pc.localDescription.type,
+            session_id: this.sessionId
+          })
+        });
+        if (!offerRes.ok) throw new Error('WebRTC signaling negotiation failed');
+        answer = await offerRes.json();
+      }
 
-      if (!offerRes.ok) throw new Error('WebRTC signaling negotiation failed');
-
-      const answer = await offerRes.json();
+      if (!answer || !answer.sdp) {
+        throw new Error(answer?.message || 'Invalid SDP answer received from host');
+      }
       await this.pc.setRemoteDescription(new RTCSessionDescription(answer));
 
     } catch (err) {
       console.warn('[WebRTC] Failed to initialize:', err);
-      this._fallbackToWebSocket();
+      if (this.isRelay) {
+        this.onStatusChange('disconnected');
+      } else {
+        this._fallbackToWebSocket();
+      }
     }
   }
 
   _fallbackToWebSocket() {
     if (this.ws) return;
+    if (this.isRelay) {
+      this.onStatusChange('disconnected');
+      return;
+    }
     this.protocol = 'WebSocket (Fallback)';
     const baseUrl = this.targetBaseUrl || window.location.origin;
     const wsUrl = `${baseUrl.replace(/^http/, 'ws')}/ws/stream?session_id=${encodeURIComponent(this.sessionId)}`;

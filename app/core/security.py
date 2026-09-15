@@ -190,6 +190,22 @@ class SessionSecurityManager:
             session.last_activity = time.time()
         return session
 
+    def validate_or_create_external_session(self, session_id: str, client_id: str = "remote") -> SessionInfo:
+        """Validates or registers an active session established via Cloud Relay."""
+        session = self.active_sessions.get(session_id)
+        if not session:
+            session = SessionInfo(
+                session_id=session_id,
+                client_id=client_id,
+                allow_mouse=True,
+                allow_keyboard=True,
+                allow_clipboard=True
+            )
+            self.active_sessions[session_id] = session
+        else:
+            session.last_activity = time.time()
+        return session
+
     def end_session(self, session_id: str):
         """Terminates an active session."""
         self.active_sessions.pop(session_id, None)

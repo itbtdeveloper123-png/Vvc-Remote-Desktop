@@ -116,6 +116,37 @@ export async function cancelConnectRequest(targetBaseUrl, requestId) {
   return await res.json();
 }
 
+export async function initRelayConnectRequest(targetPeerId) {
+  const res = await fetch('/api/relay/connect-request', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...getHostHeaders() },
+    body: JSON.stringify({ target_peer_id: targetPeerId })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.message || 'Relay connection request failed');
+  }
+  return await res.json();
+}
+
+export async function sendRelayWebRTCOffer(targetPeerId, sdp, offerType = 'offer', sessionId = null) {
+  const res = await fetch('/api/relay/webrtc-offer', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      target_peer_id: targetPeerId,
+      sdp: sdp,
+      offer_type: offerType,
+      session_id: sessionId
+    })
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.message || 'WebRTC relay negotiation failed');
+  }
+  return await res.json();
+}
+
 export async function pollIncomingRequests() {
   const res = await fetch('/api/connect-requests', { headers: getHostHeaders() });
   if (!res.ok) return { requests: [] };

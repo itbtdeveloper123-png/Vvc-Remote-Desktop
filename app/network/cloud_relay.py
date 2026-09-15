@@ -8,8 +8,9 @@ and WebRTC SDP negotiation across different internet connections (Global WAN).
 import asyncio
 import json
 import logging
+import threading
 import time
-from typing import Optional, Callable
+from typing import Optional, Callable, Dict, Any
 
 logger = logging.getLogger("CloudRelayClient")
 
@@ -30,8 +31,11 @@ class CloudRelayClient:
         self.running = False
         self.connected = False
         self.ws = None
-        self._task = None
-        self._pending_responses = {}  # request_id -> asyncio.Future
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._task: Optional[asyncio.Task] = None
+        self._pending_responses: Dict[str, asyncio.Future] = {}  # request_id / session_id -> Future
+        self._lock = threading.Lock()
 
     def is_configured(self) -> bool:
         return bool(self.relay_url and self.relay_url.startswith(("http", "ws")))
@@ -45,21 +49,49 @@ class CloudRelayClient:
         return f"{url}/ws/signal/{self.peer_id}"
 
     def start(self, loop: Optional[asyncio.AbstractEventLoop] = None):
+        """Starts the persistent relay connection in the background."""
         if not self.is_configured():
             logger.info("Cloud Relay is disabled (no central_relay_url configured). Operating in LAN P2P mode.")
             return
 
+        if self.running:
+            return
+
         self.running = True
-        loop = loop or asyncio.get_event_loop()
-        self._task = loop.create_task(self._connection_loop())
+
+        if loop and loop.is_running():
+            self._loop = loop
+            self._task = loop.create_task(self._connection_loop())
+        else:
+            self._thread = threading.Thread(target=self._run_in_thread, daemon=True, name="CloudRelayThread")
+            self._thread.start()
+
+    def _run_in_thread(self):
+        """Dedicated asyncio event loop thread for PyInstaller / desktop_app environments."""
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._connection_loop())
+        except Exception as e:
+            logger.error(f"Cloud Relay loop stopped: {e}")
+        finally:
+            try:
+                self._loop.close()
+            except Exception:
+                pass
 
     def stop(self):
         self.running = False
         if self._task:
             self._task.cancel()
+        if self._loop and self._loop.is_running():
+            try:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+            except Exception:
+                pass
 
     async def _connection_loop(self):
-        """Persistent connection loop with automatic reconnect."""
+        """Persistent connection loop with automatic reconnect and keepalive."""
         import websockets
 
         ws_url = self.get_ws_url()
@@ -68,11 +100,16 @@ class CloudRelayClient:
         while self.running:
             try:
                 logger.info(f"Connecting to Central Cloud Signaling: {ws_url}...")
-                async with websockets.connect(ws_url, ping_interval=20, ping_timeout=15) as ws:
+                async with websockets.connect(
+                    ws_url,
+                    ping_interval=20,
+                    ping_timeout=15,
+                    close_timeout=5
+                ) as ws:
                     self.ws = ws
                     self.connected = True
                     backoff = 2
-                    logger.info("[✓] Connected & Registered with Vvc Central Signaling Server!")
+                    logger.info(f"[✓] Connected & Registered with Vvc Central Signaling Server as Peer {self.peer_id}!")
 
                     while self.running:
                         message = await ws.recv()
@@ -83,9 +120,10 @@ class CloudRelayClient:
             except Exception as e:
                 self.connected = False
                 self.ws = None
-                logger.warning(f"[!] Cloud Relay disconnected: {e}. Reconnecting in {backoff}s...")
-                await asyncio.sleep(backoff)
-                backoff = min(30, backoff * 1.5)
+                if self.running:
+                    logger.warning(f"[!] Cloud Relay disconnected: {e}. Reconnecting in {backoff}s...")
+                    await asyncio.sleep(backoff)
+                    backoff = min(30, backoff * 1.5)
 
     async def _handle_message(self, raw_message: str):
         try:
@@ -98,38 +136,78 @@ class CloudRelayClient:
 
         # 1. Incoming Connection Request from remote peer
         if msg_type == "connect_request":
+            req_id = data.get("request_id")
             if self.on_incoming_request:
-                await self.on_incoming_request(data)
+                try:
+                    res = self.on_incoming_request(data)
+                    if asyncio.iscoroutine(res):
+                        res = await res
+                    if res and isinstance(res, dict):
+                        await self._send_ws({
+                            "type": "connect_response",
+                            "to": sender,
+                            "request_id": req_id,
+                            **res
+                        })
+                except Exception as e:
+                    logger.error(f"Error handling incoming connect request: {e}")
 
         # 2. Response to an outgoing request we made
         elif msg_type == "connect_response":
             req_id = data.get("request_id")
-            if req_id and req_id in self._pending_responses:
-                fut = self._pending_responses[req_id]
-                if not fut.done():
-                    fut.set_result(data)
+            with self._lock:
+                fut = self._pending_responses.get(req_id)
+            if fut and not fut.done():
+                self._resolve_future(fut, data)
 
         # 3. WebRTC Offer forwarded from remote client
         elif msg_type == "webrtc_offer":
             if self.on_offer_received:
-                answer = await self.on_offer_received(data)
-                if answer:
-                    await self.send_message({
-                        "type": "webrtc_answer",
-                        "to": sender,
-                        "sdp": answer.get("sdp"),
-                        "session_id": data.get("session_id")
-                    })
+                try:
+                    res = self.on_offer_received(data)
+                    if asyncio.iscoroutine(res):
+                        res = await res
+                    if res and isinstance(res, dict):
+                        await self._send_ws({
+                            "type": "webrtc_answer",
+                            "to": sender,
+                            "sdp": res.get("sdp"),
+                            "offer_type": res.get("type", "answer"),
+                            "session_id": data.get("session_id")
+                        })
+                except Exception as e:
+                    logger.error(f"Error handling incoming WebRTC offer: {e}")
 
         # 4. WebRTC Answer received from remote host
         elif msg_type == "webrtc_answer":
-            req_id = data.get("session_id")
-            if req_id and req_id in self._pending_responses:
-                fut = self._pending_responses[req_id]
-                if not fut.done():
-                    fut.set_result(data)
+            session_id = data.get("session_id")
+            with self._lock:
+                fut = self._pending_responses.get(session_id)
+            if fut and not fut.done():
+                self._resolve_future(fut, data)
 
-    async def send_message(self, payload: dict) -> bool:
+        # 5. Remote peer is offline
+        elif msg_type == "peer_offline":
+            target = data.get("target")
+            with self._lock:
+                for k, fut in list(self._pending_responses.items()):
+                    if not fut.done():
+                        self._resolve_future(fut, {
+                            "success": False,
+                            "status": "offline",
+                            "message": f"Partner address '{target}' is currently offline or unreachable."
+                        })
+
+    def _resolve_future(self, fut: asyncio.Future, result: Any):
+        """Thread-safely resolves a future on its loop."""
+        target_loop = getattr(fut, "_loop", None) or self._loop
+        if target_loop and target_loop.is_running():
+            target_loop.call_soon_threadsafe(lambda: not fut.done() and fut.set_result(result))
+        else:
+            if not fut.done():
+                fut.set_result(result)
+
+    async def _send_ws(self, payload: dict) -> bool:
         if not self.ws or not self.connected:
             return False
         try:
@@ -139,13 +217,36 @@ class CloudRelayClient:
             logger.error(f"Error sending cloud relay message: {e}")
             return False
 
+    async def send_message(self, payload: dict) -> bool:
+        """Thread-safe send_message callable from any event loop or thread."""
+        if not self.connected:
+            return False
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+
+        if current_loop is self._loop and self._loop is not None:
+            return await self._send_ws(payload)
+        elif self._loop and self._loop.is_running():
+            fut = asyncio.run_coroutine_threadsafe(self._send_ws(payload), self._loop)
+            return await asyncio.wrap_future(fut)
+        else:
+            return False
+
     async def request_remote_connect(self, target_id: str, timeout: float = 45.0) -> dict:
         """Initiates a connection to a remote peer via the central cloud relay."""
         clean_target = "".join(c for c in str(target_id) if c.isdigit())
         req_id = f"req_{int(time.time() * 1000)}"
 
-        future = asyncio.get_event_loop().create_future()
-        self._pending_responses[req_id] = future
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = self._loop or asyncio.get_event_loop()
+
+        future = current_loop.create_future()
+        with self._lock:
+            self._pending_responses[req_id] = future
 
         try:
             sent = await self.send_message({
@@ -155,11 +256,60 @@ class CloudRelayClient:
             })
 
             if not sent:
-                return {"success": False, "message": "Not connected to Central Relay Server"}
+                return {
+                    "success": False,
+                    "message": "Not connected to Central Relay Server (or Server Offline)"
+                }
 
             response = await asyncio.wait_for(future, timeout=timeout)
             return response
         except asyncio.TimeoutError:
-            return {"success": False, "message": "Connection request timed out"}
+            return {"success": False, "message": "Connection request timed out (partner did not respond in time)"}
         finally:
-            self._pending_responses.pop(req_id, None)
+            with self._lock:
+                self._pending_responses.pop(req_id, None)
+
+    async def request_webrtc_offer(
+        self,
+        target_id: str,
+        sdp: str,
+        offer_type: str = "offer",
+        session_id: Optional[str] = None,
+        timeout: float = 30.0
+    ) -> dict:
+        """Sends WebRTC SDP offer to remote host and waits for SDP answer."""
+        clean_target = "".join(c for c in str(target_id) if c.isdigit())
+        sid = session_id or f"sess_{int(time.time() * 1000)}"
+
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = self._loop or asyncio.get_event_loop()
+
+        future = current_loop.create_future()
+        with self._lock:
+            self._pending_responses[sid] = future
+
+        try:
+            sent = await self.send_message({
+                "type": "webrtc_offer",
+                "to": clean_target,
+                "sdp": sdp,
+                "offer_type": offer_type,
+                "session_id": sid
+            })
+
+            if not sent:
+                return {"success": False, "message": "Failed to send WebRTC offer through Cloud Relay"}
+
+            answer_data = await asyncio.wait_for(future, timeout=timeout)
+            return {
+                "success": True,
+                "sdp": answer_data.get("sdp"),
+                "type": answer_data.get("offer_type", "answer")
+            }
+        except asyncio.TimeoutError:
+            return {"success": False, "message": "WebRTC offer timed out waiting for remote host answer"}
+        finally:
+            with self._lock:
+                self._pending_responses.pop(sid, None)

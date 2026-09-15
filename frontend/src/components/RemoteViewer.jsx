@@ -57,6 +57,7 @@ export function RemoteViewer({
       peerId: session.peerId,
       targetBaseUrl: session.targetBaseUrl || '',
       sessionId: session.sessionId || session.id,
+      isRelay: !!session.isRelay || session.targetBaseUrl === 'relay',
       onTelemetry: (stats) => {
         setTelemetry((prev) => ({ ...prev, ...stats }));
       },

@@ -45,6 +45,8 @@ def build():
         "--hidden-import=winreg",
         "--hidden-import=multipart",
         "--hidden-import=app.core.autostart",
+        "--hidden-import=app.network.cloud_relay",
+        "--hidden-import=websockets",
         # Exclude brittle .NET / pythonnet CLR dependencies that cause crashes on target machines
         "--exclude-module=webview",
         "--exclude-module=pythonnet",

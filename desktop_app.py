@@ -149,6 +149,7 @@ class DesktopApplication:
         self.input_injector = None
         self.security_manager = None
         self.discovery = None
+        self.cloud_relay = None
 
     def start_backend(self):
         """Initializes engines and starts background server daemon."""
@@ -170,12 +171,25 @@ class DesktopApplication:
         self.discovery = PeerDiscovery(peer_id=self.security_manager.peer_id, port=self.port)
         self.discovery.start()
 
-        # 5. Construct FastAPI application
+        # 5. Initialize Cloud Relay Client (Global WAN Signaling)
+        self.cloud_relay = None
+        relay_url = getattr(CONFIG.network, "central_relay_url", "https://vvc-remote-relay.onrender.com")
+        if relay_url:
+            try:
+                from app.network.cloud_relay import CloudRelayClient
+                self.cloud_relay = CloudRelayClient(peer_id=self.security_manager.peer_id, relay_url=relay_url)
+                self.cloud_relay.start()
+                log_msg(f"[VvcRemote] Connecting to Central Cloud Relay: {relay_url}")
+            except Exception as e:
+                log_msg(f"[VvcRemote] Cloud Relay startup warning: {e}")
+
+        # 6. Construct FastAPI application
         app = create_app(
             self.capture_engine,
             self.input_injector,
             self.security_manager,
-            discovery=self.discovery
+            discovery=self.discovery,
+            cloud_relay=self.cloud_relay
         )
 
         # 6. Launch uvicorn in dedicated background thread
@@ -208,6 +222,8 @@ class DesktopApplication:
     def shutdown(self):
         """Clean shutdown of all engines and server."""
         log_msg("[VvcRemote] Shutting down desktop application...")
+        if self.cloud_relay:
+            self.cloud_relay.stop()
         if self.discovery:
             self.discovery.stop()
         if self.capture_engine:

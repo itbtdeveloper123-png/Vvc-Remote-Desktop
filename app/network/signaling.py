@@ -84,7 +84,8 @@ def create_app(
     capture_engine: ScreenCaptureEngine,
     input_injector: Win32InputInjector,
     security_manager: SessionSecurityManager,
-    discovery: Optional[Any] = None
+    discovery: Optional[Any] = None,
+    cloud_relay: Optional[Any] = None
 ) -> FastAPI:
     """
     Constructs the FastAPI application instance wired to the engine components.
@@ -143,6 +144,52 @@ def create_app(
 
     webrtc_manager = WebRTCHostManager(capture_engine, input_injector, security_manager)
     ws_stream_manager = WebSocketStreamManager(capture_engine, input_injector, security_manager)
+
+    # Wire Cloud Relay callbacks if available
+    if cloud_relay:
+        async def _on_relay_connect_request(data: dict):
+            sender = data.get("from", "Remote Client")
+            req = security_manager.create_connect_request(
+                peer_id=sender,
+                client_ip=f"Cloud Relay ({sender})"
+            )
+            if getattr(security_manager, "auto_accept", False):
+                security_manager.respond_to_request(
+                    request_id=req.request_id,
+                    accept=True,
+                    allow_mouse=True,
+                    allow_keyboard=True
+                )
+                return {
+                    "status": "accepted",
+                    "session_id": req.session_id,
+                    "auto_accepted": True
+                }
+            else:
+                for _ in range(60):
+                    await asyncio.sleep(0.5)
+                    curr = security_manager.connect_requests.get(req.request_id)
+                    if not curr or curr.status != "pending":
+                        if curr and curr.status == "accepted":
+                            return {
+                                "status": "accepted",
+                                "session_id": curr.session_id
+                            }
+                        else:
+                            return {"status": "rejected"}
+                return {"status": "timeout"}
+
+        async def _on_relay_offer(data: dict):
+            sdp = data.get("sdp")
+            offer_type = data.get("offer_type", "offer")
+            sid = data.get("session_id")
+            if sid:
+                security_manager.validate_or_create_external_session(sid)
+            answer = await webrtc_manager.handle_offer(sdp, offer_type)
+            return answer
+
+        cloud_relay.on_incoming_request = _on_relay_connect_request
+        cloud_relay.on_offer_received = _on_relay_offer
 
     # Static assets directory (supports normal and PyInstaller bundled environments)
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
@@ -223,7 +270,7 @@ def create_app(
         # 1. Use discovery engine if available
         if discovery:
             res = discovery.resolve(clean)
-            if res:
+            if res and res.get("type") != "self":
                 return {"success": True, **res}
 
         # 2. Direct IP / URL check
@@ -234,9 +281,35 @@ def create_app(
         # 3. Check if self
         norm_clean = clean.replace(" ", "").replace("-", "")
         if norm_clean == security_manager.get_normalized_id():
-            return {"success": True, "url": f"http://127.0.0.1:{getattr(discovery, 'port', 8000)}", "peer_id": norm_clean, "type": "self"}
+            return {"success": False, "message": "មិនអាចភ្ជាប់ទៅកាន់កុំព្យូទ័រខ្លួនឯងបានទេ (Cannot connect to your own desktop)"}
 
-        return {"success": False, "message": f"Peer '{target}' not found on local network. Ensure remote desktop is active."}
+        # 4. Check Central Cloud Relay (Global WAN)
+        relay_url = getattr(CONFIG.network, "central_relay_url", "https://vvc-remote-relay.onrender.com")
+        if relay_url:
+            try:
+                import urllib.request
+                import json
+                req = urllib.request.Request(
+                    f"{relay_url.rstrip('/')}/api/resolve/{norm_clean}",
+                    headers={"User-Agent": "VvcRemote/1.2"}
+                )
+                with urllib.request.urlopen(req, timeout=3.0) as resp:
+                    if resp.status == 200:
+                        data = json.loads(resp.read().decode())
+                        if data.get("online"):
+                            return {
+                                "success": True,
+                                "peer_id": norm_clean,
+                                "type": "relay",
+                                "relay": True,
+                                "is_relay": True,
+                                "online": True,
+                                "relay_url": relay_url
+                            }
+            except Exception:
+                pass
+
+        return {"success": False, "message": f"រកមិនឃើញកុំព្យូទ័រ '{target}' ឡើយ (កុំព្យូទ័រនោះអាចមិនទាន់បើក ឬនៅក្រៅបណ្តាញ)"}
 
     @app.get("/api/peers")
     async def get_discovered_peers():
@@ -566,6 +639,37 @@ def create_app(
             await websocket.close(code=4001, reason="Unauthorized session")
             return
         await ws_stream_manager.handle_stream(websocket, session_id)
+
+    # --- Global Cloud Relay Remote Access Endpoints ---
+    class RelayConnectInitRequest(BaseModel):
+        target_peer_id: str
+
+    @app.post("/api/relay/connect-request")
+    async def handle_relay_connect_request(req_data: RelayConnectInitRequest, request: Request):
+        require_host_authorization(request)
+        if not cloud_relay:
+            return {"success": False, "message": "Cloud Relay client is not enabled"}
+        res = await cloud_relay.request_remote_connect(req_data.target_peer_id, timeout=45.0)
+        return res
+
+    class RelayWebRTCOfferRequest(BaseModel):
+        target_peer_id: str
+        sdp: str
+        offer_type: str = "offer"
+        session_id: Optional[str] = None
+
+    @app.post("/api/relay/webrtc-offer")
+    async def handle_relay_webrtc_offer(offer_req: RelayWebRTCOfferRequest, request: Request):
+        if not cloud_relay:
+            return {"success": False, "message": "Cloud Relay client is not enabled"}
+        res = await cloud_relay.request_webrtc_offer(
+            target_id=offer_req.target_peer_id,
+            sdp=offer_req.sdp,
+            offer_type=offer_req.offer_type,
+            session_id=offer_req.session_id,
+            timeout=30.0
+        )
+        return res
 
     # --- Remote File Explorer & Transfer Endpoints ---
     @app.get("/api/files/drives")

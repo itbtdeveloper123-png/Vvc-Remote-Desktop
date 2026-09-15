@@ -24,6 +24,7 @@ import {
   setAutoAccept,
   resolvePeer,
   initConnectRequest,
+  initRelayConnectRequest,
   pollConnectStatus,
   cancelConnectRequest,
   pollIncomingRequests,
@@ -251,67 +252,98 @@ export default function App() {
     setConnectStatus('Resolving partner network location...');
 
     let targetBaseUrl = '';
+    let isRelay = false;
     if (explicitIp) {
       targetBaseUrl = explicitIp.startsWith('http') ? explicitIp : `http://${explicitIp}`;
     } else {
       try {
         const resolved = await resolvePeer(cleanId);
-        if (resolved && (resolved.ip || resolved.host)) {
-          const host = resolved.ip || resolved.host;
-          const port = resolved.port || 8000;
-          targetBaseUrl = `http://${host}:${port}`;
+        if (resolved && resolved.success && (resolved.type === 'relay' || resolved.relay || resolved.url || resolved.ip || resolved.host)) {
+          if (resolved.type === 'relay' || resolved.relay) {
+            isRelay = true;
+            targetBaseUrl = 'relay';
+          } else if (resolved.url) {
+            targetBaseUrl = resolved.url;
+          } else {
+            const host = resolved.ip || resolved.host;
+            const port = resolved.port || 8000;
+            targetBaseUrl = `http://${host}:${port}`;
+          }
         } else {
-          // If resolution not found on LAN, fallback to local origin
-          targetBaseUrl = window.location.origin;
+          setConnecting(false);
+          setConnectStatus('');
+          showToast(
+            resolved?.message || `រកមិនឃើញកុំព្យូទ័រ '${cleanId}' ឡើយ។ សូមពិនិត្យថាកុំព្យូទ័រដៃគូបានបើកកម្មវិធី Vvc Remote ហើយឬនៅ`,
+            'error'
+          );
+          return;
         }
-      } catch (_) {
-        targetBaseUrl = window.location.origin;
+      } catch (err) {
+        setConnecting(false);
+        setConnectStatus('');
+        showToast(`មិនអាចភ្ជាប់ទៅកាន់ '${cleanId}' បានឡើយ: ${err.message}`, 'error');
+        return;
       }
     }
 
     try {
-      setConnectStatus('Requesting remote host authorization...');
-      const reqRes = await initConnectRequest(targetBaseUrl, hostInfo?.peer_id || '999999999');
+      setConnectStatus(isRelay ? 'Requesting partner authorization via Cloud Relay...' : 'Requesting remote host authorization...');
+      
+      let reqRes;
+      if (isRelay) {
+        reqRes = await initRelayConnectRequest(cleanId);
+      } else {
+        reqRes = await initConnectRequest(targetBaseUrl, hostInfo?.peer_id || '999999999');
+      }
 
-      const requestId = reqRes.request_id;
-      setPendingReq({ id: requestId, baseUrl: targetBaseUrl, targetId: cleanId });
-
-      // If auto-accepted immediately
-      if (reqRes.auto_accepted || reqRes.status === 'accepted') {
-        openSession(cleanId, targetBaseUrl, reqRes.session_id);
+      if (!reqRes || reqRes.success === false || reqRes.status === 'offline' || reqRes.status === 'rejected') {
+        setConnecting(false);
+        setConnectStatus('');
+        showToast(reqRes?.message || 'Connection request was declined or partner is offline', 'error');
         return;
       }
 
-      // Poll authorization status
-      setConnectStatus('Waiting for partner to accept connection...');
-      if (pollTimerRef.current) clearInterval(pollTimerRef.current);
+      const requestId = reqRes.request_id || reqRes.session_id;
+      setPendingReq({ id: requestId, baseUrl: targetBaseUrl, targetId: cleanId });
 
-      let attempts = 0;
-      const maxAttempts = 40; // 60 seconds
+      // If auto-accepted immediately (or relay answered with accept)
+      if (reqRes.auto_accepted || reqRes.status === 'accepted') {
+        openSession(cleanId, targetBaseUrl, reqRes.session_id, isRelay);
+        return;
+      }
 
-      pollTimerRef.current = setInterval(async () => {
-        attempts++;
-        try {
-          const stat = await pollConnectStatus(targetBaseUrl, requestId);
-          if (!stat) return;
+      if (!isRelay) {
+        // Poll authorization status on LAN
+        setConnectStatus('Waiting for partner to accept connection...');
+        if (pollTimerRef.current) clearInterval(pollTimerRef.current);
 
-          if (stat.status === 'accepted') {
-            clearInterval(pollTimerRef.current);
-            pollTimerRef.current = null;
-            openSession(cleanId, targetBaseUrl, stat.session_id);
-          } else if (stat.status === 'rejected') {
-            clearInterval(pollTimerRef.current);
-            pollTimerRef.current = null;
-            setConnecting(false);
-            showToast('Connection request was declined by the partner', 'error');
-          } else if (stat.status === 'timeout' || attempts >= maxAttempts) {
-            clearInterval(pollTimerRef.current);
-            pollTimerRef.current = null;
-            setConnecting(false);
-            showToast('Connection request timed out', 'error');
-          }
-        } catch (_) {}
-      }, 1500);
+        let attempts = 0;
+        const maxAttempts = 40; // 60 seconds
+
+        pollTimerRef.current = setInterval(async () => {
+          attempts++;
+          try {
+            const stat = await pollConnectStatus(targetBaseUrl, requestId);
+            if (!stat) return;
+
+            if (stat.status === 'accepted') {
+              clearInterval(pollTimerRef.current);
+              pollTimerRef.current = null;
+              openSession(cleanId, targetBaseUrl, stat.session_id, false);
+            } else if (stat.status === 'rejected') {
+              clearInterval(pollTimerRef.current);
+              pollTimerRef.current = null;
+              setConnecting(false);
+              showToast('Connection request was declined by the partner', 'error');
+            } else if (stat.status === 'timeout' || attempts >= maxAttempts) {
+              clearInterval(pollTimerRef.current);
+              pollTimerRef.current = null;
+              setConnecting(false);
+              showToast('Connection request timed out', 'error');
+            }
+          } catch (_) {}
+        }, 1500);
+      }
 
     } catch (err) {
       setConnecting(false);
@@ -324,7 +356,7 @@ export default function App() {
       clearInterval(pollTimerRef.current);
       pollTimerRef.current = null;
     }
-    if (pendingReq.id && pendingReq.baseUrl) {
+    if (pendingReq.id && pendingReq.baseUrl && pendingReq.baseUrl !== 'relay') {
       try {
         await cancelConnectRequest(pendingReq.baseUrl, pendingReq.id);
       } catch (_) {}
@@ -335,7 +367,7 @@ export default function App() {
     showToast('Connection request cancelled', 'info');
   };
 
-  const openSession = (peerId, targetBaseUrl, sessionId) => {
+  const openSession = (peerId, targetBaseUrl, sessionId, isRelay = false) => {
     setConnecting(false);
     setConnectStatus('');
     setPendingReq({ id: null, baseUrl: '', targetId: '' });
@@ -348,6 +380,7 @@ export default function App() {
       peerId: peerId,
       targetBaseUrl: targetBaseUrl,
       sessionId: sessionId || `sess_${Date.now()}`,
+      isRelay: isRelay || targetBaseUrl === 'relay',
       alias: formattedId,
       title: formattedId
     };
@@ -356,8 +389,8 @@ export default function App() {
     setActiveTabId(newTabId);
 
     // Save history
-    addHistory(peerId, targetBaseUrl.replace(/^https?:\/\//, '')).then(loadHistory);
-    showToast(`Connected to ${formattedId}`, 'success');
+    addHistory(peerId, isRelay ? 'Global Cloud Relay' : targetBaseUrl.replace(/^https?:\/\//, '')).then(loadHistory);
+    showToast(`Connected to ${formattedId}${isRelay ? ' (via Cloud Relay)' : ''}`, 'success');
   };
 
   const handleCloseTab = (tabId) => {

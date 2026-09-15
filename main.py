@@ -67,12 +67,23 @@ def main():
     # 3. Initialize Security Manager
     security_manager = SessionSecurityManager(peer_id=args.peer_id, pin=args.pin)
 
-    # 4. Initialize Peer Discovery Engine
+    # 4. Initialize Peer Discovery Engine (LAN)
     discovery = PeerDiscovery(peer_id=security_manager.peer_id, port=args.port)
     discovery.start()
 
-    # 5. Construct FastAPI Application
-    app = create_app(capture_engine, input_injector, security_manager, discovery=discovery)
+    # 5. Initialize Cloud Relay Client (Global WAN Signaling)
+    cloud_relay = None
+    relay_url = CONFIG.network.central_relay_url
+    if relay_url:
+        try:
+            from app.network.cloud_relay import CloudRelayClient
+            cloud_relay = CloudRelayClient(peer_id=security_manager.peer_id, relay_url=relay_url)
+            cloud_relay.start()
+        except Exception as e:
+            print(f"[!] Warning: Could not connect to central relay: {e}")
+
+    # 6. Construct FastAPI Application
+    app = create_app(capture_engine, input_injector, security_manager, discovery=discovery, cloud_relay=cloud_relay)
 
     local_ip = get_local_ip()
     res_str = f"{capture_engine.screen_width}x{capture_engine.screen_height}"
@@ -85,12 +96,14 @@ def main():
         fps=args.fps
     )
 
-    # 6. Start Server
+    # 7. Start Server
     try:
         uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
     except KeyboardInterrupt:
         print("\n[!] Shutting down host...")
     finally:
+        if cloud_relay:
+            cloud_relay.stop()
         discovery.stop()
         capture_engine.stop()
 

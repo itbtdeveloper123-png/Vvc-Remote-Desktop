@@ -5,7 +5,7 @@ import time
 from typing import Dict, Optional, Set
 import numpy as np
 import av
-from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack, RTCIceCandidate
+from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack, RTCIceCandidate, RTCConfiguration, RTCIceServer
 from aiortc.contrib.media import MediaBlackhole
 import aiortc.codecs.vpx as vpx_codec
 import aiortc.codecs.h264 as h264_codec
@@ -100,7 +100,27 @@ class WebRTCHostManager:
         self.data_channels: Dict[RTCPeerConnection, any] = {}
 
     async def create_peer_connection(self) -> RTCPeerConnection:
-        pc = RTCPeerConnection()
+        ice_servers = []
+        raw_ice = getattr(CONFIG.network, "ice_servers", [])
+        for entry in raw_ice:
+            urls = entry.get("urls") if isinstance(entry, dict) else None
+            username = entry.get("username") if isinstance(entry, dict) else None
+            credential = entry.get("credential") if isinstance(entry, dict) else None
+            if urls:
+                if username and credential:
+                    ice_servers.append(RTCIceServer(urls=urls, username=username, credential=credential))
+                elif isinstance(urls, str):
+                    ice_servers.append(RTCIceServer(urls))
+                elif isinstance(urls, list):
+                    for u in urls:
+                        ice_servers.append(RTCIceServer(u))
+        if not ice_servers:
+            ice_servers = [
+                RTCIceServer("stun:stun.l.google.com:19302"),
+                RTCIceServer("stun:stun1.l.google.com:19302"),
+            ]
+        config = RTCConfiguration(iceServers=ice_servers)
+        pc = RTCPeerConnection(configuration=config)
         self.peer_connections.add(pc)
 
         # Add our desktop video stream track
@@ -171,10 +191,10 @@ class WebRTCHostManager:
         answer = RTCSessionDescription(sdp=ans_sdp, type=answer.type)
         await pc.setLocalDescription(answer)
 
-        # Allow host ICE candidates to gather into local description
+        # Allow host ICE candidates to gather into local description (STUN reflexive candidates)
         if pc.iceGatheringState != "complete":
             try:
-                for _ in range(6):
+                for _ in range(24):
                     if pc.iceGatheringState == "complete":
                         break
                     await asyncio.sleep(0.05)
