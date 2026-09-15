@@ -154,23 +154,27 @@ def create_app(
                 client_ip=f"Cloud Relay ({sender})"
             )
             if getattr(security_manager, "auto_accept", False):
-                security_manager.respond_to_request(
+                session = security_manager.respond_to_request(
                     request_id=req.request_id,
                     accept=True,
                     allow_mouse=True,
                     allow_keyboard=True
                 )
+                input_injector.allow_mouse = True
+                input_injector.allow_keyboard = True
                 return {
                     "status": "accepted",
-                    "session_id": req.session_id,
+                    "session_id": session.session_id if session else req.session_id,
                     "auto_accepted": True
                 }
             else:
-                for _ in range(60):
+                for _ in range(120):
                     await asyncio.sleep(0.5)
-                    curr = security_manager.connect_requests.get(req.request_id)
+                    curr = security_manager.get_request(req.request_id)
                     if not curr or curr.status != "pending":
                         if curr and curr.status == "accepted":
+                            input_injector.allow_mouse = True
+                            input_injector.allow_keyboard = True
                             return {
                                 "status": "accepted",
                                 "session_id": curr.session_id
@@ -257,6 +261,8 @@ def create_app(
             "pending_requests": len(security_manager.get_pending_requests()) if is_host else 0,
             "allow_mouse": input_injector.allow_mouse,
             "allow_keyboard": input_injector.allow_keyboard,
+            "cloud_relay_connected": bool(cloud_relay.connected) if cloud_relay else False,
+            "cloud_relay_url": cloud_relay.relay_url if cloud_relay else None,
             "ice_servers": CONFIG.network.ice_servers
         }
 

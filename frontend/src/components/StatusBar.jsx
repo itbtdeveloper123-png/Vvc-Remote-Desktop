@@ -1,5 +1,5 @@
 import React from 'react';
-import { ShieldCheck, Wifi, Eye } from 'lucide-react';
+import { ShieldCheck, Wifi, Eye, Globe } from 'lucide-react';
 
 export function StatusBar({
   hostInfo,
@@ -7,6 +7,7 @@ export function StatusBar({
   packetLoss = '0.0%'
 }) {
   const activeViewers = hostInfo?.active_sessions || 0;
+  const relayOnline = !!hostInfo?.cloud_relay_connected;
 
   return (
     <footer className="app-status-bar">
@@ -16,6 +17,16 @@ export function StatusBar({
           <span className="stat-dot-green" />
           <span className="stat-label">Host:</span>
           <span className="stat-val">Ready</span>
+        </div>
+
+        <div className="status-stat-divider" />
+
+        <div className="status-stat-item">
+          <Globe size={12} color={relayOnline ? "var(--emerald)" : "var(--amber)"} />
+          <span className="stat-label">Cloud Relay:</span>
+          <span className="stat-val" style={{ color: relayOnline ? "var(--emerald)" : "var(--amber)" }}>
+            {relayOnline ? "Global Online" : "Connecting..."}
+          </span>
         </div>
 
         <div className="status-stat-divider" />

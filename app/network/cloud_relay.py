@@ -200,12 +200,20 @@ class CloudRelayClient:
 
     def _resolve_future(self, fut: asyncio.Future, result: Any):
         """Thread-safely resolves a future on its loop."""
-        target_loop = getattr(fut, "_loop", None) or self._loop
-        if target_loop and target_loop.is_running():
-            target_loop.call_soon_threadsafe(lambda: not fut.done() and fut.set_result(result))
-        else:
+        target_loop = None
+        try:
+            target_loop = fut.get_loop()
+        except Exception:
+            target_loop = getattr(fut, "_loop", None) or self._loop
+
+        def _do_resolve():
             if not fut.done():
                 fut.set_result(result)
+
+        if target_loop and target_loop.is_running():
+            target_loop.call_soon_threadsafe(_do_resolve)
+        else:
+            _do_resolve()
 
     async def _send_ws(self, payload: dict) -> bool:
         if not self.ws or not self.connected:
@@ -234,7 +242,7 @@ class CloudRelayClient:
         else:
             return False
 
-    async def request_remote_connect(self, target_id: str, timeout: float = 45.0) -> dict:
+    async def request_remote_connect(self, target_id: str, timeout: float = 65.0) -> dict:
         """Initiates a connection to a remote peer via the central cloud relay."""
         clean_target = "".join(c for c in str(target_id) if c.isdigit())
         req_id = f"req_{int(time.time() * 1000)}"
