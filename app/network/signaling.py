@@ -189,8 +189,13 @@ def create_app(
             sid = data.get("session_id")
             if sid:
                 security_manager.validate_or_create_external_session(sid)
-            answer = await webrtc_manager.handle_offer(sdp, offer_type)
-            return answer
+            try:
+                answer = await webrtc_manager.handle_offer(sdp, offer_type)
+                return answer
+            except Exception as e:
+                import logging
+                logging.getLogger("Signaling").error(f"Error handling WebRTC offer: {e}")
+                return {"error": str(e), "type": "error"}
 
         cloud_relay.on_incoming_request = _on_relay_connect_request
         cloud_relay.on_offer_received = _on_relay_offer
